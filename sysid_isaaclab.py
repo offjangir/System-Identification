@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import imageio
 
 # Import Isaac Lab app launcher first
 from isaaclab.app import AppLauncher
@@ -209,7 +210,7 @@ class SysIDIsaacLab:
     # ------------------------------------------------------------------ #
     #  PD Evaluation                                                     #
     # ------------------------------------------------------------------ #
-    def test_pd_params_all(self, kp, kd, batch_idx=0, step_per_wp=3, record_demo=True):
+    def test_pd_params_all(self, kp, kd, batch_idx=0, step_per_wp=3, record_demo=False):
         traj_batch = self.get_traj_batch(batch_idx)   # size == n_envs
         self.reset_all_envs_to_init(traj_batch)
 
@@ -347,45 +348,50 @@ class SysIDIsaacLab:
         with tqdm(range(step_max), desc="SimAnn") as pbar:
             for t in pbar:
                 batch_idx = np.random.randint(num_batches)
-                #  Do not do concatenate again and agian
-                _, _, comb_e = self.test_pd_params_all(np.concatenate([kp_cur,kp_fixed]), np.concatenate([kd_cur, kd_fixed]).copy(), batch_idx=batch_idx)
 
-                # print(f"[INFO] Pos error: {pos_e:.4f}, Rot error: {rot_e:.4f}, Comb error: {comb_e:.4f}")
+                _, _, comb_e = self.test_pd_params_all(
+                    np.concatenate([kp_cur, kp_fixed]),
+                    np.concatenate([kd_cur, kd_fixed]),
+                    batch_idx=batch_idx
+                )
+
+                if comb_e < best_err:
+                    best_kp = kp_cur.copy()
+                    best_kd = kd_cur.copy()
+                    best_err = comb_e
+
+                # --- Propose new candidate (perturb one joint) ---
+                temp  = T_init * (1 - t / step_max)
+                scale = max(0.1, temp / T_init)
+                kp_sigma = 10.0 * scale
+                kd_sigma =  1.0 * scale
+
+                j = np.random.randint(opt_dof)
+
                 kp_new = kp_cur.copy()
                 kd_new = kd_cur.copy()
-                temp = T_init * (1 - t / step_max)
-                scale = max(0.1, temp / T_init)  # don't go to zero
-                print(f"[INFO] Scale: {scale}")
-                kp_sigma = 100.0 * scale  # big moves early, sigma is the standard deviation of the normal distribution
-                kd_sigma = 10.0  * scale  # small moves early, sigma is the standard deviation of the normal distribution
-
-                idx = np.arange(opt_dof)
-                # Move all randomly idx Randomly not equal to each other
-                kp_new[idx] += int(np.random.randn() * kp_sigma)
-                kd_new[idx] += int(np.random.randn() * kd_sigma)
+                kp_new[j] += np.round(np.random.randn() * kp_sigma).astype(int)
+                kd_new[j] += np.round(np.random.randn() * kd_sigma).astype(int)
                 kp_new = np.clip(kp_new, *kp_rng)
                 kd_new = np.clip(kd_new, *kd_rng)
 
-                _, _, comb_new = self.test_pd_params_all(np.concatenate([kp_new, kp_fixed]).copy(), np.concatenate([kd_new, kd_fixed]).copy(), batch_idx=batch_idx)
+                # --- Evaluate candidate ---
+                _, _, comb_new = self.test_pd_params_all(
+                    np.concatenate([kp_new, kp_fixed]),
+                    np.concatenate([kd_new, kd_fixed]),
+                    batch_idx=batch_idx
+                )
 
-                # Acceptance criterion
-                delta = comb_e - comb_new
-                temp = T_init * (1 - t / step_max)
-                # print(f"[INFO] Temp: {temp}")
-                # print(f"[INFO] Delta: {delta}")
-                # print("kp_cur:", kp_cur)
-                # print("kp_new:", kp_new)
-                # print("kd_cur:", kd_cur)
-                # print("kd_new:", kd_new)
-
+                # --- Acceptance criterion ---
+                delta = comb_e - comb_new  # positive means new is better
                 if delta > 0 or np.random.rand() < np.exp(delta / (temp + 1e-9)):
                     kp_cur = kp_new
                     kd_cur = kd_new
 
-                if comb_new < best_err:
-                    best_kp = kp_new.copy()
-                    best_kd = kd_new.copy()
-                    best_err = comb_new
+                    if comb_new < best_err:  # <-- was comb_e, fixed to comb_new
+                        best_kp = kp_cur.copy()
+                        best_kd = kd_cur.copy()
+                        best_err = comb_new
 
                 pbar.set_postfix(err=f"{comb_e:.4f}", best=f"{best_err:.4f}")
                 # Evaluate and plot
@@ -400,7 +406,7 @@ class SysIDIsaacLab:
                     # concatenate best_kp and fixed kp
                     test_kp = np.concatenate([best_kp, kp_fixed])
                     test_kd = np.concatenate([best_kd, kd_fixed])
-                    self.evaluate_and_plot(test_kp, test_kd, step_per_wp=3, out_dir="./results_isaaclab", t=t)
+                    self.evaluate_and_plot(test_kp, test_kd, step_per_wp=3, out_dir="./results_isaaclab")
                     print(f"[INFO] Step {t} of {step_max} - Current error: {comb_e:.4f}, Best error: {best_err:.4f}")
 
         print(f"\n[RESULT] Best combined error = {best_err:.4f}")
@@ -420,7 +426,7 @@ class SysIDIsaacLab:
         kd: np.ndarray,
         step_per_wp: int = 3,
         out_dir: str = "./results_isaaclab",
-        t: int = 0,
+        run_id: int = 0,
     ):
         """
         Evaluate the best PD parameters and generate plots.
@@ -428,9 +434,9 @@ class SysIDIsaacLab:
         Args:
             kp: Position gains
             kd: Velocity gains
-            steps: Number of trajectory steps
             step_per_wp: Simulation steps per waypoint
             out_dir: Output directory for plots
+            run_id: Run identifier for output filenames
         """
         os.makedirs(out_dir, exist_ok=True)
         traj_batch = self.get_traj_batch(0) 
@@ -454,21 +460,19 @@ class SysIDIsaacLab:
         
         pose_des = np.stack(pose_list, axis=0)  # (B,T,6)
         # -------- add env origins ONLY to xyz (env-local -> world) --------
-        # env_origins = self.sim.scene.env_origins.detach().cpu().numpy().astype(np.float32)  # (B,3)
-        # pose_des[:, :, 0:3] += env_origins[:, None, :]  # broadcast over time
+        env_origins = self.sim.scene.env_origins.detach().cpu().numpy().astype(np.float32)  # (B,3)
+        pose_des[:, :, 0:3] += env_origins[:, None, :]  # broadcast over time
 
         pose_des = torch.from_numpy(pose_des).to(self.device)  # (B,T,6)
 
-        pos_e, rot_e, comb_e = [], [], []
+        pos_errors = []
+        rot_errors = []
         ee_pos_list = []
-        tot_pos = 0.0
-        tot_rot = 0.0
-        comb_e = []
-        frames = []
-        import imageio
-        gif_path = os.path.join(f"tcp_track_scene.gif")
+        
+        gif_path = os.path.join(out_dir, f"tcp_track_scene_{run_id}.gif")
         writer = imageio.get_writer(gif_path, mode="I", fps=20)
         print(f"[INFO] Writing gif to {gif_path}")
+        
         for i in range(max_steps):
             curr_waypoint = pose_des[:, i, :]
             ee_pos_w = curr_waypoint[:, :3]
@@ -476,68 +480,68 @@ class SysIDIsaacLab:
             root_pose_w = self.sim.robot.data.root_pose_w
             ee_pos_b, ee_quat_b = subtract_frame_transforms(
                 root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-                ee_pos_w,   ee_quat_w
+                ee_pos_w, ee_quat_w
             )
             q_des = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
             q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
             q_des_full[:, :7] = q_des
             q_des_full[:, 7:] = 0.04
-            # run subloop
+            
+            # Run subloop
             for _ in range(step_per_wp):
-                # use position control
                 self.sim.robot.set_joint_position_target(q_des_full[:, :7], joint_ids=self.sim.joint_ids)
                 self.sim.step(render=True)
                 self.sim.scene.update(self.sim.dt)
 
             frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
             writer.append_data(frame)
-            frames.append(frame)
 
             ee_p, ee_q = self.sim.get_ee_pose()
             ee_p = ee_p.cpu().numpy()
             ee_q = ee_q.cpu().numpy()
-
             curr_waypoint_np = curr_waypoint.cpu().numpy()
 
             pos_err = np.linalg.norm(ee_p - curr_waypoint_np[:, :3], axis=1)
             des_q = eulertotquat(curr_waypoint_np[:, 3:6])
-            # print(f"[INFO] Pos error: {pos_err.mean():.4f}")
-
             rot_err = np.array([self.quat_angle_error(ee_q[j], des_q[j]) for j in range(self.n_envs)])
-            tot_pos += pos_err.mean()
-            tot_rot += rot_err.mean()
-            comb_e.append(tot_pos + tot_rot)
+            
+            pos_errors.append(pos_err.mean())
+            rot_errors.append(rot_err.mean())
             ee_pos_list.append(ee_p)
 
-        pos_e = np.array(pos_e)
-        rot_e = np.array(rot_e)
-        comb_e = np.array(comb_e)
-        ee_pos_list = np.array(ee_pos_list).reshape(max_steps, 3)
-        pose_des = pose_des[:, :, :3].squeeze(0).detach().cpu().numpy()
+        writer.close()
+        
+        pos_errors = np.array(pos_errors)
+        rot_errors = np.array(rot_errors)
+        ee_pos_list = np.array(ee_pos_list)  # (max_steps, n_envs, 3)
 
-        # np.savez(os.path.join(out_dir, "ee_pos_and_waypoints.npz"), ee_pos_list=ee_pos_list, pose_des=pose_des)
-        # print("[INFO] Saved ee_pos_and_waypoints to", os.path.join(out_dir, "ee_pos_and_waypoints.npz"))
-        # print("[INFO] ee_pos_list:", ee_pos_list.shape) 
-        # print("[INFO] pose_des:", pose_des.shape)
+        # Transpose ee_pos_list to (n_envs, max_steps, 3)
+        ee_pos_list = ee_pos_list.transpose(1, 0, 2)
+        pose_des_np = pose_des[:, :, :3].detach().cpu().numpy()  # (n_envs, max_steps, 3)
 
+        # Extract first environment for plotting
+        ee_pos_env0 = ee_pos_list[0, :, :]
+        pose_des_env0 = pose_des_np[0, :, :]
+        
         # Generate plot
         plt.figure(figsize=(10, 6))
-        # Tag X Y Z for each plot
-        plt.plot(ee_pos_list[:, 0], label="X_")
-        plt.plot(ee_pos_list[:, 1], label="Y")
-        plt.plot(ee_pos_list[:, 2], label="Z")
-        plt.plot(pose_des[:, 0], label="X_Actual")
-        plt.plot(pose_des[:, 1], label="Y_Actual")
-        plt.plot(pose_des[:, 2], label="Z_Actual")
+        plt.plot(ee_pos_env0[:, 0], label="X_Actual", linestyle="-")
+        plt.plot(ee_pos_env0[:, 1], label="Y_Actual", linestyle="-")
+        plt.plot(ee_pos_env0[:, 2], label="Z_Actual", linestyle="-")
+        plt.plot(pose_des_env0[:, 0], label="X_Desired", linestyle="--")
+        plt.plot(pose_des_env0[:, 1], label="Y_Desired", linestyle="--")
+        plt.plot(pose_des_env0[:, 2], label="Z_Desired", linestyle="--")
         plt.xlabel("Step")
-        plt.ylabel("Position")
+        plt.ylabel("Position (m)")
         plt.grid(True)
         plt.legend(loc="upper right")
-        plt.title("End Effector Position and Waypoints")
-        plt.savefig(os.path.join(out_dir, f"ee_pos_and_waypoints_{t}.png"))
+        plt.title("End Effector Position: Actual vs Desired")
+        plt.savefig(os.path.join(out_dir, f"ee_pos_and_waypoints_{run_id}.png"))
         plt.close()
-
-
+        
+        # Print summary statistics
+        print(f"[INFO] Mean position error: {pos_errors.mean():.4f} m")
+        print(f"[INFO] Mean rotation error: {rot_errors.mean():.4f} rad")
 
 
     def record_demo(self):
@@ -605,7 +609,6 @@ class SysIDIsaacLab:
         writer = imageio.get_writer(gif_path, mode="I", fps=20)
         traj_batch = self.get_traj_batch(0)
         self.reset_all_envs_to_init(traj_batch)
-
 
         frames = []
         # get pos and quat for all envs
@@ -692,14 +695,14 @@ def main():
     )
 
     # env.record_demo_position_control()
-    env.record_demo_position_control()
+    # env.record_demo_position_control()
     # env.record_demo_position_control_arm_1_only()
     # env.record_demo_force_control(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], step_per_wp=20)
     # error = env.test_pd_params_all(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], batch_idx=0, step_per_wp=2, record_demo=True)
     # print("[INFO] Error:", error)
 
     # Run simulated annealing
-    # best_kp, best_kd = env.run_sysid_simulated_annealing(step_max=args_cli.step_max)
+    best_kp, best_kd = env.run_sysid_simulated_annealing(step_max=args_cli.step_max)
     # env.evaluate_and_plot(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], step_per_wp=3, out_dir="./results_isaaclab", t=1)
     
     # Evaluate and plot
