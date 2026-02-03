@@ -57,7 +57,7 @@ class ReplaySceneCfg(InteractiveSceneCfg):
     # Camera for rendering
 
     camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/CameraSensor1",
+        prim_path="/World/CameraSensor",
         update_period=0,
         height=480,
         width=640,
@@ -372,13 +372,11 @@ class SimulatorIsaacLab:
 
     def set_cam_pose(self):
         """
-        Set the camera pose.
+        Set the camera pose (single global camera).
         """
-        self.camera_targets = torch.tensor([[0.0, 0.0, 0.0]], device=self.device, dtype=torch.float32)
-        self.camera_positions = torch.tensor([[2.0, 2.0, 2.0]], device=self.device, dtype=torch.float32)
-        self.camera_targets = self.camera_targets.repeat(self.n_envs, 1)
-        self.camera_positions = self.camera_positions.repeat(self.n_envs, 1)
-        self.camera.set_world_poses_from_view(self.camera_positions, self.camera_targets)
+        self.camera_target = torch.tensor([[0.0, 0.0, 0.0]], device=self.device, dtype=torch.float32)
+        self.camera_position = torch.tensor([[2.0, 2.0, 2.0]], device=self.device, dtype=torch.float32)
+        self.camera.set_world_poses_from_view(self.camera_position, self.camera_target)
         self.camera.update(self.dt)
 
     def step(self, render: bool = False, steps: int = 1):
@@ -557,7 +555,7 @@ class SimulatorIsaacLab:
         ik_command = torch.cat([target_pos, target_quat], dim=-1)  # (n_envs, 7)
 
         # set command once
-        self.diff_ik_controller.reset()
+        # self.diff_ik_controller.reset()
         self.diff_ik_controller.set_command(ik_command)
 
         # current state (must be (n_envs, ...))
@@ -581,6 +579,16 @@ class SimulatorIsaacLab:
         joint_pos_des = self.diff_ik_controller.compute(
             ee_pos_b, ee_quat_b, jacobian, joint_pos
         )
+        # check if inverse kinematics failed # mask the failed environments
+        if joint_pos_des is None:
+            return None
+        #  if joint pos des is nan
+        if joint_pos_des.isnan().any():
+            import pdb; pdb.set_trace()
+        mask = joint_pos_des.isnan().any(dim=-1)
+        
+        joint_pos_des[mask] = joint_pos[mask]
+
         return joint_pos_des
 
 

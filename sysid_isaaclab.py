@@ -27,7 +27,7 @@ from isaaclab.app import AppLauncher
 # Add argument parser
 parser = argparse.ArgumentParser(description="System ID with simulated annealing on DROID trajectories")
 parser.add_argument("--num_envs", type=int, default=2, help="Number of parallel environments")
-parser.add_argument("--step_max", type=int, default=25, help="Number of simulated annealing steps")
+parser.add_argument("--step_max", type=int, default=1000, help="Number of simulated annealing steps")
 parser.add_argument("--data_dir", type=str, default="/data/user_data/yjangir/yash/IsaacLab-Cluster/scene_generation_isaaclab/data/droid_numpy/",
                     help="Path to DROID dataset")
 parser.add_argument("--output_dir", type=str, default="./results_isaaclab",
@@ -156,6 +156,12 @@ class SysIDIsaacLab:
  
     def reset_all_envs_to_init(self, traj_batch):
         """Reset all environments to their initial trajectory poses."""
+
+        joint_pos = self.sim.robot.data.default_joint_pos.clone()
+        joint_vel = self.sim.robot.data.default_joint_vel.clone()
+        self.sim.robot.write_joint_state_to_sim(joint_pos, joint_vel)
+        self.sim.warmup()
+
         pos_init, quat_init = [], []
         
         # print(f"[INFO] Traj batch: {traj_batch}")
@@ -197,11 +203,13 @@ class SysIDIsaacLab:
         self.sim.robot.write_joint_state_to_sim(q_full[:, :7], q_vel[:, :7], joint_ids=self.sim.joint_ids, env_ids=env_ids)
         self.sim.step()
         self.sim.scene.update(self.sim.dt)
+
+
     def get_traj_batch(self, batch_idx: int):
         start = (batch_idx * self.n_envs) % len(self.trajectories)
         end = start + self.n_envs
 
-        print(f"[INFO] Batch {batch_idx} - Start: {start}, End: {end}")
+        # print(f"[INFO] Batch {batch_idx} - Start: {start}, End: {end}")
         if end <= len(self.trajectories):
             return self.trajectories[start:end]
         else:
@@ -212,7 +220,12 @@ class SysIDIsaacLab:
     # ------------------------------------------------------------------ #
     def test_pd_params_all(self, kp, kd, batch_idx=0, step_per_wp=3, record_demo=False):
         traj_batch = self.get_traj_batch(batch_idx)   # size == n_envs
+        self.sim.diff_ik_controller.reset()
         self.reset_all_envs_to_init(traj_batch)
+        self.sim.diff_ik_controller.reset()
+
+        # reset IK controller
+        self.sim.warmup()
 
         kp_t = torch.tensor(kp, device=self.device, dtype=torch.float32).unsqueeze(0).expand(self.n_envs, -1)
         kd_t = torch.tensor(kd, device=self.device, dtype=torch.float32).unsqueeze(0).expand(self.n_envs, -1)
@@ -326,8 +339,8 @@ class SysIDIsaacLab:
         opt_dof = 7   # Only optimize arm joints
 
         # Initial PD values for arm
-        kp_cur = np.array([900, 900, 700, 700, 400, 400, 400], dtype=int)
-        kd_cur = np.array([90, 90, 70, 70, 40, 40, 40], dtype=int)
+        kp_cur = np.array([800, 800, 600, 600, 300, 300, 300], dtype=int)
+        kd_cur = np.array([80, 80, 60, 60, 30, 30, 30], dtype=int)
 
         # Fixed values for gripper
         kp_fixed = np.array([100, 100])
@@ -349,64 +362,59 @@ class SysIDIsaacLab:
             for t in pbar:
                 batch_idx = np.random.randint(num_batches)
 
+                kp_full = np.concatenate([kp_cur, kp_fixed])
+                kd_full = np.concatenate([kd_cur, kd_fixed])
                 _, _, comb_e = self.test_pd_params_all(
-                    np.concatenate([kp_cur, kp_fixed]),
-                    np.concatenate([kd_cur, kd_fixed]),
+                    kp_full,
+                    kd_full,
                     batch_idx=batch_idx
                 )
 
-                if comb_e < best_err:
-                    best_kp = kp_cur.copy()
-                    best_kd = kd_cur.copy()
-                    best_err = comb_e
+                pbar.set_postfix(err=f"{comb_e:.4f}", best=f"{best_err:.4f}")
 
                 # --- Propose new candidate (perturb one joint) ---
-                temp  = T_init * (1 - t / step_max)
-                scale = max(0.1, temp / T_init)
-                kp_sigma = 10.0 * scale
-                kd_sigma =  1.0 * scale
-
-                j = np.random.randint(opt_dof)
-
                 kp_new = kp_cur.copy()
                 kd_new = kd_cur.copy()
-                kp_new[j] += np.round(np.random.randn() * kp_sigma).astype(int)
-                kd_new[j] += np.round(np.random.randn() * kd_sigma).astype(int)
+                idx = np.random.randint(opt_dof)  # only first 7 joints
+                kp_new[idx] += int((np.random.rand() - 0.5) * 40)
+                kd_new[idx] += int((np.random.rand() - 0.5) * 8)
                 kp_new = np.clip(kp_new, *kp_rng)
                 kd_new = np.clip(kd_new, *kd_rng)
 
+                kp_new_full = np.concatenate([kp_new, kp_fixed])
+                kd_new_full = np.concatenate([kd_new, kd_fixed])
                 # --- Evaluate candidate ---
                 _, _, comb_new = self.test_pd_params_all(
-                    np.concatenate([kp_new, kp_fixed]),
-                    np.concatenate([kd_new, kd_fixed]),
+                    kp_new_full,
+                    kd_new_full,
                     batch_idx=batch_idx
                 )
 
                 # --- Acceptance criterion ---
-                delta = comb_e - comb_new  # positive means new is better
+                delta = comb_e - comb_new
+                temp  = T_init * (1 - t / step_max)
+                print(f"[INFO] Temp: {temp}")
+                print(f"[INFO] Kp new: {kp_new}")
+                print(f"[INFO] Kd new: {kd_new}")
                 if delta > 0 or np.random.rand() < np.exp(delta / (temp + 1e-9)):
                     kp_cur = kp_new
                     kd_cur = kd_new
-
-                    if comb_new < best_err:  # <-- was comb_e, fixed to comb_new
-                        best_kp = kp_cur.copy()
-                        best_kd = kd_cur.copy()
-                        best_err = comb_new
+                
+                if comb_e < best_err:
+                    best_kp = kp_full.copy()
+                    best_kd = kd_full.copy()
+                    best_err = comb_e
 
                 pbar.set_postfix(err=f"{comb_e:.4f}", best=f"{best_err:.4f}")
                 # Evaluate and plot
-                if t % 10 == 0:
+                if t % 1 == 0:
                     print(f"[INFO] Step {t} of {step_max} - Evaluating and plotting")
                     print(f"[INFO] Best Kp: {best_kp}")
                     print(f"[INFO] Best Kd: {best_kd}")
                     print(f"[INFO] Current error: {comb_e:.4f}, Best error: {best_err:.4f}")
                     print(f"[INFO] Evaluating and plotting")
-                    best_kp = best_kp.copy()
-                    best_kd = best_kd.copy()
-                    # concatenate best_kp and fixed kp
-                    test_kp = np.concatenate([best_kp, kp_fixed])
-                    test_kd = np.concatenate([best_kd, kd_fixed])
-                    self.evaluate_and_plot(test_kp, test_kd, step_per_wp=3, out_dir="./results_isaaclab")
+
+                    self.evaluate_and_plot(best_kp, best_kd, step_per_wp=3, out_dir="./results_isaaclab", run_id=t)
                     print(f"[INFO] Step {t} of {step_max} - Current error: {comb_e:.4f}, Best error: {best_err:.4f}")
 
         print(f"\n[RESULT] Best combined error = {best_err:.4f}")
@@ -439,9 +447,13 @@ class SysIDIsaacLab:
             run_id: Run identifier for output filenames
         """
         os.makedirs(out_dir, exist_ok=True)
-        traj_batch = self.get_traj_batch(0) 
-        
+        #  take a random batch index
+        batch_idx = np.random.randint(0, 10)
+        traj_batch = self.get_traj_batch(batch_idx) 
+
+        self.sim.diff_ik_controller.reset()
         self.reset_all_envs_to_init(traj_batch)
+        self.sim.diff_ik_controller.reset()
         
         kp_t = torch.tensor(kp, device=self.device, dtype=torch.float32).unsqueeze(0)
         kd_t = torch.tensor(kd, device=self.device, dtype=torch.float32).unsqueeze(0)
@@ -703,6 +715,11 @@ def main():
 
     # Run simulated annealing
     best_kp, best_kd = env.run_sysid_simulated_annealing(step_max=args_cli.step_max)
+    # save best kp and kd in text file
+    with open(os.path.join(args_cli.output_dir, "best_kp.txt"), "w") as f:
+        f.write(f"Best Kp: {best_kp}\n")
+    with open(os.path.join(args_cli.output_dir, "best_kd.txt"), "w") as f:
+        f.write(f"Best Kd: {best_kd}\n")
     # env.evaluate_and_plot(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], step_per_wp=3, out_dir="./results_isaaclab", t=1)
     
     # Evaluate and plot
