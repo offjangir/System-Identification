@@ -316,10 +316,19 @@ class SimulatorIsaacLab:
         kd_t = torch.as_tensor(kd, device=device, dtype=torch.float32)
 
         # normalize to (n_envs, num_joints)
+
+        # normalize to (n_envs, num_joints)
         if kp_t.dim() == 1:
-            kp_t = kp_t.unsqueeze(0).expand(self.n_envs, -1)
+            kp_t = kp_t.unsqueeze(0)          # (1, J)
         if kd_t.dim() == 1:
-            kd_t = kd_t.unsqueeze(0).expand(self.n_envs, -1)
+            kd_t = kd_t.unsqueeze(0)          # (1, J)
+
+
+        # If single row, broadcast to all envs
+        if kp_t.shape[0] == 1 and env_ids.numel() > 1:
+            kp_t = kp_t.expand(self.n_envs, -1)   # (n_envs, J)
+        if kd_t.shape[0] == 1 and env_ids.numel() > 1:
+            kd_t = kd_t.expand(self.n_envs, -1)   # (n_envs, J)
 
         # robust num joints
         if hasattr(robot, "num_joints"):
