@@ -26,6 +26,13 @@ def load_droid_numpy_extracted_droid(root_dir: str):
 
     return trajectories
 
+def load_data_from_bridge_data(root_dir: str):
+    """
+    Load data from Bridge data format.
+    """
+    data = np.load(os.path.join(root_dir, "data.npy"))
+    return data
+
 def load_droid_extracted_droid(root_dir: str, n_envs: int):
     """
     Load trajectories from DROID numpy format.

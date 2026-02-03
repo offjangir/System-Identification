@@ -196,7 +196,7 @@ class SimulatorIsaacLab:
         # Create simulation context
         sim_cfg = sim_utils.SimulationCfg(
             dt=self.dt,
-            device=self.device
+            device=self.device        
             )
 
         self.sim = sim_utils.SimulationContext(sim_cfg)

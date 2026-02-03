@@ -25,7 +25,7 @@ from isaaclab.app import AppLauncher
 
 # Add argument parser
 parser = argparse.ArgumentParser(description="System ID with simulated annealing on DROID trajectories")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
+parser.add_argument("--num_envs", type=int, default=2, help="Number of parallel environments")
 parser.add_argument("--step_max", type=int, default=25, help="Number of simulated annealing steps")
 parser.add_argument("--data_dir", type=str, default="/data/user_data/yjangir/yash/IsaacLab-Cluster/scene_generation_isaaclab/data/droid_numpy/",
                     help="Path to DROID dataset")
@@ -108,12 +108,56 @@ class SysIDIsaacLab:
     # ------------------------------------------------------------------ #
     #  Environment Operations                                            #
     # ------------------------------------------------------------------ #
+    # def reset_all_envs_to_init(self, traj_batch):
+    #     """Reset all environments to their initial trajectory poses."""
+    #     pos_init, quat_init = [], []
+        
+    #     # print(f"[INFO] Traj batch: {traj_batch}")
+
+    #     for env_i in range(self.n_envs):
+    #         data = traj_batch[env_i]
+    #         p = data["cartesian_position"][0][:3]
+    #         euler = data["cartesian_position"][0][3:6]
+    #         quat = eulertotquat(euler)
+    #         pos_init.append(p)
+    #         quat_init.append(quat)
+    #     # Compute IK for initial poses
+    #     # Change dimensions of pos_init and quat_init to (n_envs, 3) and (n_envs, 4)
+    #     pos_init = np.asarray(pos_init, dtype=np.float32).reshape(-1, 3)
+    #     quat_init = np.asarray(quat_init, dtype=np.float32).reshape(-1, 4)
+
+    #     pos_w = torch.tensor(pos_init, device=self.device, dtype=torch.float32)
+    #     quat_w = torch.tensor(quat_init, device=self.device, dtype=torch.float32)
+
+    #     # 1) if traj is env-local, add env origins
+    #     pos_w = pos_w + self.sim.scene.env_origins  # (B,3)
+
+    #     # 2) convert world target -> base target
+    #     # print Traget ee pose 
+    #     root_pose_w = self.sim.robot.data.root_pose_w  # (B,7)
+    #     pos_b, quat_b = subtract_frame_transforms(
+    #         root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+    #         pos_w, quat_w
+    #     )
+
+    #     # 3) IK in base frame
+    #     q_ik = self.sim.inverse_kinematics_batched(pos_b, quat_b)
+        
+    #     # Build full joint position tensor (arm + gripper)
+    #     q_full = torch.zeros((self.n_envs, 9), device=self.device)
+    #     q_full[:, :7] = q_ik
+    #     q_full[:, 7:] = 0.04  # Default gripper position
+    #     q_vel = torch.zeros_like(q_full)
+    #     env_ids = torch.arange(self.n_envs, device=self.device)
+    #     self.sim.robot.write_joint_state_to_sim(q_full[:, :7], q_vel[:, :7], joint_ids=self.sim.joint_ids, env_ids=env_ids)
+    #     self.sim.step()
+    #     self.sim.scene.update(self.sim.dt)
+ 
     def reset_all_envs_to_init(self, traj_batch):
         """Reset all environments to their initial trajectory poses."""
         pos_init, quat_init = [], []
         
         # print(f"[INFO] Traj batch: {traj_batch}")
-
         for env_i in range(self.n_envs):
             data = traj_batch[env_i]
             p = data["cartesian_position"][0][:3]
@@ -125,27 +169,33 @@ class SysIDIsaacLab:
         # Change dimensions of pos_init and quat_init to (n_envs, 3) and (n_envs, 4)
         pos_init = np.asarray(pos_init, dtype=np.float32).reshape(-1, 3)
         quat_init = np.asarray(quat_init, dtype=np.float32).reshape(-1, 4)
-        # print("[INFO] pos_init:", pos_init.shape)
-        # print("[INFO] quat_init:", quat_init.shape) 
-        q_ik = self.sim.inverse_kinematics_batched(
-            torch.tensor(pos_init, device=self.device, dtype=torch.float32),
-            torch.tensor(quat_init, device=self.device, dtype=torch.float32)
+
+        pos_w = torch.tensor(pos_init, device=self.device, dtype=torch.float32)
+        quat_w = torch.tensor(quat_init, device=self.device, dtype=torch.float32)
+
+        # 1) if traj is env-local, add env origins
+        pos_w = pos_w + self.sim.scene.env_origins  # (B,3)
+
+        # 2) convert world target -> base target
+        # print Traget ee pose 
+        root_pose_w = self.sim.robot.data.root_pose_w  # (B,7)
+        pos_b, quat_b = subtract_frame_transforms(
+            root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+            pos_w, quat_w
         )
+
+        # 3) IK in base frame
+        q_ik = self.sim.inverse_kinematics_batched(pos_b, quat_b)
         
         # Build full joint position tensor (arm + gripper)
         q_full = torch.zeros((self.n_envs, 9), device=self.device)
         q_full[:, :7] = q_ik
         q_full[:, 7:] = 0.04  # Default gripper position
-        
-        # Set joint positions (this also sets position targets via updated set_qpos)
-        self.sim.set_qpos(q_full)
-        
-        # Step to stabilize while maintaining joint position targets
-        for _ in range(50):
-            # Maintain position targets to prevent falling during stabilization
-            self.sim.control_position(q_full)
-            self.sim.step()
-
+        q_vel = torch.zeros_like(q_full)
+        env_ids = torch.arange(self.n_envs, device=self.device)
+        self.sim.robot.write_joint_state_to_sim(q_full[:, :7], q_vel[:, :7], joint_ids=self.sim.joint_ids, env_ids=env_ids)
+        self.sim.step()
+        self.sim.scene.update(self.sim.dt)
     def get_traj_batch(self, batch_idx: int):
         start = (batch_idx * self.n_envs) % len(self.trajectories)
         end = start + self.n_envs
@@ -159,7 +209,7 @@ class SysIDIsaacLab:
     # ------------------------------------------------------------------ #
     #  PD Evaluation                                                     #
     # ------------------------------------------------------------------ #
-    def test_pd_params_all(self, kp, kd, batch_idx=0, step_per_wp=3, record_demo=False):
+    def test_pd_params_all(self, kp, kd, batch_idx=0, step_per_wp=3, record_demo=True):
         traj_batch = self.get_traj_batch(batch_idx)   # size == n_envs
         self.reset_all_envs_to_init(traj_batch)
 
@@ -275,8 +325,8 @@ class SysIDIsaacLab:
         opt_dof = 7   # Only optimize arm joints
 
         # Initial PD values for arm
-        kp_cur = np.array([500, 500, 500, 500, 500, 500, 500], dtype=int)
-        kd_cur = np.array([50, 50, 50, 50, 50, 50, 50], dtype=int)
+        kp_cur = np.array([900, 900, 700, 700, 400, 400, 400], dtype=int)
+        kd_cur = np.array([90, 90, 70, 70, 40, 40, 40], dtype=int)
 
         # Fixed values for gripper
         kp_fixed = np.array([100, 100])
@@ -297,20 +347,17 @@ class SysIDIsaacLab:
         with tqdm(range(step_max), desc="SimAnn") as pbar:
             for t in pbar:
                 batch_idx = np.random.randint(num_batches)
-                kp_full = np.concatenate([kp_cur, kp_fixed])
-                kd_full = np.concatenate([kd_cur, kd_fixed])
+                #  Do not do concatenate again and agian
+                _, _, comb_e = self.test_pd_params_all(np.concatenate([kp_cur,kp_fixed]), np.concatenate([kd_cur, kd_fixed]).copy(), batch_idx=batch_idx)
 
-                _, _, comb_e = self.test_pd_params_all(kp_full, kd_full, batch_idx=batch_idx)
                 # print(f"[INFO] Pos error: {pos_e:.4f}, Rot error: {rot_e:.4f}, Comb error: {comb_e:.4f}")
                 kp_new = kp_cur.copy()
                 kd_new = kd_cur.copy()
-                
                 temp = T_init * (1 - t / step_max)
                 scale = max(0.1, temp / T_init)  # don't go to zero
                 print(f"[INFO] Scale: {scale}")
                 kp_sigma = 100.0 * scale  # big moves early, sigma is the standard deviation of the normal distribution
                 kd_sigma = 10.0  * scale  # small moves early, sigma is the standard deviation of the normal distribution
-
 
                 idx = np.arange(opt_dof)
                 # Move all randomly idx Randomly not equal to each other
@@ -318,9 +365,8 @@ class SysIDIsaacLab:
                 kd_new[idx] += int(np.random.randn() * kd_sigma)
                 kp_new = np.clip(kp_new, *kp_rng)
                 kd_new = np.clip(kd_new, *kd_rng)
-                kp_new = np.concatenate([kp_new, kp_fixed])
-                kd_new = np.concatenate([kd_new, kd_fixed])
-                _, _, comb_new = self.test_pd_params_all(kp_new, kd_new, batch_idx=batch_idx)
+
+                _, _, comb_new = self.test_pd_params_all(np.concatenate([kp_new, kp_fixed]).copy(), np.concatenate([kd_new, kd_fixed]).copy(), batch_idx=batch_idx)
 
                 # Acceptance criterion
                 delta = comb_e - comb_new
@@ -354,7 +400,7 @@ class SysIDIsaacLab:
                     # concatenate best_kp and fixed kp
                     test_kp = np.concatenate([best_kp, kp_fixed])
                     test_kd = np.concatenate([best_kd, kd_fixed])
-                    self.evaluate_and_plot(best_kp, best_kd, step_per_wp=3, out_dir="./results_isaaclab", t=t)
+                    self.evaluate_and_plot(test_kp, test_kd, step_per_wp=3, out_dir="./results_isaaclab", t=t)
                     print(f"[INFO] Step {t} of {step_max} - Current error: {comb_e:.4f}, Best error: {best_err:.4f}")
 
         print(f"\n[RESULT] Best combined error = {best_err:.4f}")
@@ -388,7 +434,7 @@ class SysIDIsaacLab:
         """
         os.makedirs(out_dir, exist_ok=True)
         traj_batch = self.get_traj_batch(0) 
-
+        
         self.reset_all_envs_to_init(traj_batch)
         
         kp_t = torch.tensor(kp, device=self.device, dtype=torch.float32).unsqueeze(0)
@@ -408,8 +454,8 @@ class SysIDIsaacLab:
         
         pose_des = np.stack(pose_list, axis=0)  # (B,T,6)
         # -------- add env origins ONLY to xyz (env-local -> world) --------
-        env_origins = self.sim.scene.env_origins.detach().cpu().numpy().astype(np.float32)  # (B,3)
-        pose_des[:, :, 0:3] += env_origins[:, None, :]  # broadcast over time
+        # env_origins = self.sim.scene.env_origins.detach().cpu().numpy().astype(np.float32)  # (B,3)
+        # pose_des[:, :, 0:3] += env_origins[:, None, :]  # broadcast over time
 
         pose_des = torch.from_numpy(pose_des).to(self.device)  # (B,T,6)
 
@@ -490,226 +536,133 @@ class SysIDIsaacLab:
         plt.title("End Effector Position and Waypoints")
         plt.savefig(os.path.join(out_dir, f"ee_pos_and_waypoints_{t}.png"))
         plt.close()
-    # def record_demo(self):
-    #     """
-    #     Record the demo.
-    #     """
-    #     import imageio
-    #     gif_path = os.path.join(f"tcp_track_scene.gif")
-    #     writer = imageio.get_writer(gif_path, mode="I", fps=20)
-    #     self.reset_all_envs_to_init()
-    #     frames = []
-    #     for i in range(len(self.cartesian_position[0])):
-    #         root_pose_w = self.sim.robot.data.root_pose_w
-    #         ee_pose_w = self.sim.robot.data.body_pose_w[:, self.sim.ee_body_id]
 
-    #         ee_pos_b, ee_quat_b = subtract_frame_transforms(
-    #             root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-    #             ee_pose_w[:, 0:3],   ee_pose_w[:, 3:7],
-    #         )
 
-    #         jacobian = self.sim.robot.root_physx_view.get_jacobians()[:, self.sim.ee_jacobi_idx, :, self.sim.joint_ids]
-    #         joint_pos = self.sim.robot.data.joint_pos[:, self.sim.joint_ids]
 
-    #         des_q = self.sim.diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
-    #         self.sim.robot.set_joint_position_target(des_q, joint_ids=self.sim.joint_ids)
 
-    #         self.sim.scene.write_data_to_sim()
-    #         self.sim.step(render=True)
-    #         self.sim.scene.update(self.sim.dt)
-    #         self.sim.camera.update(self.sim.dt)
-    #         frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
-    #         writer.append_data(frame)
-    #         frames.append(frame)
-    #     writer.close()
+    def record_demo(self):
+        """
+        Record the demo.
+        """
+        import imageio
+        gif_path = os.path.join(f"tcp_track_scene.gif")
+        writer = imageio.get_writer(gif_path, mode="I", fps=20)
+        # self.reset_all_envs_to_init()
+        # reset_here manually
+        # use self.cartesian_position
+        # draw spheres
+        frames = []
+        spawn_trajectory_markers_usd_cartesian(self.sim.sim, self.cartesian_position, radius=0.01)
 
-    #     video_path = os.path.join(f"tcp_track_scene.mp4")
-    #     imageio.mimsave(video_path, frames, fps=30)
-    #     print(f"[INFO] Saved video to {video_path} ({len(frames)} frames)")
+        self.sim.step(render=True)
+        self.sim.scene.update(self.sim.dt)
+        self.sim.camera.update(self.sim.dt)
+        frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
+        frames.append(frame)
+        writer.append_data(frame)
+        # save
+        imageio.mimsave(gif_path, frames, fps=20)
 
-    # def record_demo_position_control(self):
-    #     """
-    #     Record the demo for position control.
-    #     """
-    #     import imageio
-    #     gif_path = os.path.join(f"tcp_track_scene_position_control.gif")
-    #     writer = imageio.get_writer(gif_path, mode="I", fps=20)
-    #     self.reset_all_envs_to_init()
-    #     frames = []
-    #     # get pos and quat for all envs
-    #     max_steps = max(len(data["cartesian_position"]) for data in self.trajectories)
-    #     pose_list = []
+        frames = []
 
-    #     for env_i in range(self.n_envs):
-    #         traj = np.array(self.trajectories[env_i]["cartesian_position"])  # (Ti, 6)
-    #         T = traj.shape[0]
+        for i in range(len(self.cartesian_position)):
+            curr_waypoint = self.cartesian_position[i]
+            ee_pos_w = torch.tensor(curr_waypoint[:3], dtype=torch.float32).to(self.device)
+            ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[3:6]), dtype=torch.float32).to(self.device)
+            target_pos_w = ee_pos_w.view(1, 3).repeat(self.n_envs, 1)
+            target_quat_w = ee_quat_w.view(1, 4).repeat(self.n_envs, 1)
+            root_pose_w = self.sim.robot.data.root_pose_w
+            ee_pos_b, ee_quat_b = subtract_frame_transforms(
+                root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+                target_pos_w.repeat(self.n_envs, 1), target_quat_w.repeat(self.n_envs, 1)
+            )
+            jacobian = self.sim.robot.root_physx_view.get_jacobians()[:, self.sim.ee_jacobi_idx, :, self.sim.joint_ids]
+            joint_pos = self.sim.robot.data.joint_pos[:, self.sim.joint_ids]
+            des_q = self.sim.diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
+            vel_target = torch.zeros_like(des_q)
+            vel_target[:, 7:] = 0.04
+            # self.sim.robot.write_joint_state_to_sim(des_q[:, :7], vel_target[:, :7], joint_ids=self.sim.joint_ids)
+            self.sim.robot.set_joint_position_target(des_q[:, :7], joint_ids=self.sim.joint_ids)
+            self.sim.scene.write_data_to_sim()
+            self.sim.step(render=True)
+            self.sim.scene.update(self.sim.dt)
+            self.sim.camera.update(self.sim.dt)
+            frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
+            writer.append_data(frame)
+            frames.append(frame)
+        writer.close()
 
-    #         if T < max_steps:
-    #             pad_len = max_steps - T
-    #             last = traj[-1][None, :]                     # (1,6)
-    #             pad = np.repeat(last, pad_len, axis=0)       # (pad_len,6)
-    #             traj = np.concatenate([traj, pad], axis=0)   # (max_steps,6)
-
-    #         pose_list.append(traj)
-
-    #     pose_des = np.stack(pose_list, axis=0)  # (B, max_steps, 6)
-
-    #     env_origins = self.sim.scene.env_origins.detach().cpu().numpy()  # (B,3)
-
-    #     env_pad = np.zeros((self.n_envs, 1, 6), dtype=pose_des.dtype)
-    #     env_pad[:, 0, :3] = env_origins
-
-    #     pose_des = pose_des + env_pad
-    #     pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32)
-
-    #     pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32).reshape(self.n_envs, max_steps, 6)
-    #     print("[INFO] pose_des:", pose_des.shape)
-
-    #     for i in range(max_steps):
-    #         curr_waypoint = pose_des[:, i, :]
-    #         ee_pos_w = curr_waypoint[:, :3]
-    #         ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
-    #         root_pose_w = self.sim.robot.data.root_pose_w
-    #         ee_pos_b, ee_quat_b = subtract_frame_transforms(
-    #             root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-    #             ee_pos_w,   ee_quat_w
-    #         )
-    #         q_des = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
-    #         q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
-    #         q_des_full[:, :7] = q_des
-    #         q_des_full[:, 7:] = 0.04
-    #         # use position control
-    #         self.sim.robot.set_joint_position_target(q_des_full[:, :7], joint_ids=self.sim.joint_ids)
-    #         self.sim.step(render=True)
-    #         self.sim.scene.update(self.sim.dt)
-    #         self.sim.camera.update(self.sim.dt)
-    #         frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
-    #         writer.append_data(frame)
-    #         frames.append(frame)
-    #     writer.close()
-    #     video_path = os.path.join(f"tcp_track_scene_position_control.mp4")
-    #     imageio.mimsave(video_path, frames, fps=30)
-    #     print(f"[INFO] Saved video to {video_path} ({len(frames)} frames)")
-
+        video_path = os.path.join(f"tcp_track_scene.mp4")
+        imageio.mimsave(video_path, frames, fps=30)
+        print(f"[INFO] Saved video to {video_path} ({len(frames)} frames)")
     
+    def record_demo_position_control(self):
+        """
+        Record the demo for position control.
+        """
+        import imageio
+        gif_path = os.path.join(f"tcp_track_scene_position_control.gif")
+        writer = imageio.get_writer(gif_path, mode="I", fps=20)
+        traj_batch = self.get_traj_batch(0)
+        self.reset_all_envs_to_init(traj_batch)
 
-    # def record_demo_force_control(self, kp, kd, step_per_wp=20):
-    #     """
-    #     Record the demo for force control.
-    #     """
-    #     kp_t = torch.tensor(kp, device=self.device, dtype=torch.float32).unsqueeze(0)
-    #     kd_t = torch.tensor(kd, device=self.device, dtype=torch.float32).unsqueeze(0)
-    #     q_pos = self.sim.get_qpos()
-    #     q_vel = self.sim.get_qvel()
 
-    #     import imageio
-    #     gif_path = os.path.join(f"tcp_track_scene_position_control.gif")
-    #     writer = imageio.get_writer(gif_path, mode="I", fps=20)
-    #     self.reset_all_envs_to_init()
-    #     frames = []
-    #     # get pos and quat for all envs
-    #     min_steps = min(len(data["cartesian_position"]) for data in self.trajectories)
+        frames = []
+        # get pos and quat for all envs
+        max_steps = max(len(data["cartesian_position"]) for data in traj_batch)
+        pose_list = []
 
-    #     # Convert to Shape B, N, 3 and B, N, 4
-    #     pose_des = []
-    #     for env_i in range(self.n_envs):
-    #         data = self.trajectories[env_i]["cartesian_position"]
-    #         pose_des.append(data[:min_steps])
-        
-    #     pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32).reshape(self.n_envs, min_steps, 6)
-    #     print("[INFO] pose_des:", pose_des.shape)
-        
-    #     for i in range(min_steps):
-    #         curr_waypoint = pose_des[:, i, :]
-    #         ee_pos_w = curr_waypoint[:, :3]
-    #         ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
-    #         ee_pos_w = torch.tensor(data["cartesian_position"][:, :3], device=self.device, dtype=torch.float32)
-    #         ee_quat_w = torch.tensor(eulertotquat(data["cartesian_position"][: , 3:6]), device=self.device, dtype=torch.float32)
+        for env_i in range(self.n_envs):
+            traj = np.array(traj_batch[env_i]["cartesian_position"])  # (Ti, 6)
+            T = traj.shape[0]
 
-    #         root_pose_w = self.sim.robot.data.root_pose_w
-    #         # Subract the transfrom from the end effector to the world frame and get the Jacobian
+            if T < max_steps:
+                pad_len = max_steps - T
+                last = traj[-1][None, :]                     # (1,6)
+                pad = np.repeat(last, pad_len, axis=0)       # (pad_len,6)
+                traj = np.concatenate([traj, pad], axis=0)   # (max_steps,6)
 
-    #         ee_pos_b, ee_quat_b = subtract_frame_transforms(
-    #             root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-    #             ee_pos_w,   ee_quat_w,
-    #         )
-    #         # Visualize the ee_pos_b and ee_quat_b in simulator
-    #         q_des = self.sim.inverse_kinematics_batched(torch.tensor(ee_pos_b, device=self.device, dtype=torch.float32), torch.tensor(ee_quat_b, device=self.device, dtype=torch.float32))
-    #         print("[INFO] q_des:", q_des.shape)
-    #         q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
-    #         q_des_full[:, :7] = q_des
-    #         q_des_full[:, 7:] = 0.04
+            pose_list.append(traj)
 
-    #         torque = kp_t.expand(self.n_envs, -1) * (q_des_full - q_pos) \
-    #                - kd_t.expand(self.n_envs, -1) * q_vel
-    #         torque = torch.clamp(torque, -100, 100)
+        pose_des = np.stack(pose_list, axis=0)  # (B, max_steps, 6)
 
-    #         self.sim.control_force(torque)
-    #         self.sim.step(step_per_wp)
-    #         self.sim.scene.update(self.sim.dt)
-    #         self.sim.camera.update(self.sim.dt)
-    #         frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
-    #         writer.append_data(frame)
-    #         frames.append(frame)
-    #     writer.close()
-    #     video_path = os.path.join(f"tcp_track_scene.mp4")
-    #     imageio.mimsave(video_path, frames, fps=30)
-    #     print(f"[INFO] Saved video to {video_path} ({len(frames)} frames)")
+        env_origins = self.sim.scene.env_origins.detach().cpu().numpy()  # (B,3)
 
-    # def record_demo_position_control_arm_1_only(self):
-    #     """
-    #     Record the demo for position control of arm 1 only.
-    #     """
-    #     import imageio
-    #     gif_path = os.path.join(f"tcp_track_scene_arm_1_only.gif")
-    #     writer = imageio.get_writer(gif_path, mode="I", fps=20)
-    #     self.reset_all_envs_to_init()
-    #     frames = []
-    #     # get pos and quat for all envs
-    #     # min_steps = min(len(data["cartesian_position"]) for data in self.trajectories)
-    #     # min_steps = len(self.trajectories[0]["cartesian_position"])
-    #     min_steps = len(self.trajectories[0]["cartesian_position"])
+        env_pad = np.zeros((self.n_envs, 1, 6), dtype=pose_des.dtype)
+        env_pad[:, 0, :3] = env_origins
 
-    #     # Convert to Shape B, N, 3 and B, N, 4
-    #     pose_des = []
-    #     print(len(self.trajectories[0]["cartesian_position"]))
+        pose_des = pose_des + env_pad
+        pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32)
 
-    #     for env_i in range(self.n_envs):
-    #         data = self.trajectories[env_i]["cartesian_position"]
-    #         pose_des.append(data[:min_steps])
-        
-    #     pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32).reshape(self.n_envs, min_steps, 6)
-        
-    #     for i in range(min_steps):
-    #         print("[INFO] i:", i)
-    #         curr_waypoint = pose_des[:, i, :]
-    #         ee_pos_w = curr_waypoint[:, :3]
-    #         ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
-    #         # add subset of joints to simulate
-    #         for _ in range(3):
-    #             root_pose_w = self.sim.robot.data.root_pose_w
-    #             ee_pos_b, ee_quat_b = subtract_frame_transforms(
-    #                 root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-    #                 ee_pos_w,   ee_quat_w
-    #             )
+        pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32).reshape(self.n_envs, max_steps, 6)
+        print("[INFO] pose_des:", pose_des.shape)
 
-    #             des_q = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
-    #             q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
-    #             q_des_full[:, :7] = des_q
-    #             q_des_full[:, 7:] = 0.04
-    #             self.sim.robot.set_joint_position_target(des_q, joint_ids=self.sim.joint_ids)
-    #             self.sim.scene.write_data_to_sim()
-    #             self.sim.step(render=True)
-    #             self.sim.scene.update(self.sim.dt)
-    #             self.sim.camera.update(self.sim.dt)
-    #             frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
-    #             writer.append_data(frame)
-    #             frames.append(frame)
+        for i in range(max_steps):
+            curr_waypoint = pose_des[:, i, :]
+            ee_pos_w = curr_waypoint[:, :3]
+            ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
+            root_pose_w = self.sim.robot.data.root_pose_w
+            ee_pos_b, ee_quat_b = subtract_frame_transforms(
+                root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+                ee_pos_w,   ee_quat_w
+            )
+            q_des = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
+            q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
+            q_des_full[:, :7] = q_des
+            q_des_full[:, 7:] = 0.04
+            # use position control
+            self.sim.robot.set_joint_position_target(q_des_full[:, :7], joint_ids=self.sim.joint_ids)
+            self.sim.step(render=True)
+            self.sim.scene.update(self.sim.dt)
+            self.sim.camera.update(self.sim.dt)
+            frame = self.sim.camera.data.output["rgb"][0].detach().cpu().numpy()
+            writer.append_data(frame)
+            frames.append(frame)
+        writer.close()
+        video_path = os.path.join(f"tcp_track_scene_position_control.mp4")
+        imageio.mimsave(video_path, frames, fps=30)
+        print(f"[INFO] Saved video to {video_path} ({len(frames)} frames)")
 
-    #     writer.close()
-    #     video_path = os.path.join(f"tcp_track_scene_arm_1_only.mp4")
-    #     imageio.mimsave(video_path, frames, fps=30)
-    #     print(f"[INFO] Saved video to {video_path} ({len(frames)} frames)")
 
 # --------------------------------------------------------------------------- #
 #  Main                                                                       #
@@ -738,15 +691,16 @@ def main():
         show_viewer=not args_cli.headless,
     )
 
-    # env.record_demo()
     # env.record_demo_position_control()
+    env.record_demo_position_control()
     # env.record_demo_position_control_arm_1_only()
     # env.record_demo_force_control(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], step_per_wp=20)
     # error = env.test_pd_params_all(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], batch_idx=0, step_per_wp=2, record_demo=True)
     # print("[INFO] Error:", error)
 
     # Run simulated annealing
-    best_kp, best_kd = env.run_sysid_simulated_annealing(step_max=args_cli.step_max)
+    # best_kp, best_kd = env.run_sysid_simulated_annealing(step_max=args_cli.step_max)
+    # env.evaluate_and_plot(kp=[900, 900, 700, 700, 400, 400, 400, 100, 100], kd=[90, 90, 70, 70, 40, 40, 40, 10, 10], step_per_wp=3, out_dir="./results_isaaclab", t=1)
     
     # Evaluate and plot
     # env.evaluate_and_plot(best_kp, best_kd, steps=30, step_per_wp=20, out_dir=args_cli.output_dir)
