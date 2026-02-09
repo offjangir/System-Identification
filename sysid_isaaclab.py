@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-sysid_isaaclab.py – System Identification with Simulated Annealing on DROID trajectories
+sysid_isaaclab.py – System Identification with Simulated Annealing on robot trajectories
 using Isaac Lab simulator.
 
-This script performs system identification to find optimal PD gains for the Franka Panda
-robot that minimize tracking error on DROID trajectory datasets.
+This script performs system identification to find optimal PD gains for robots
+(Franka Panda or WidowX) that minimize tracking error on trajectory datasets (DROID or Bridge).
 
 Usage:
-    ./isaaclab.sh -p scene_generation_isaaclab/sysid_isaaclab.py --num_envs 43 --step_max 25
+    # For DROID dataset with Franka Panda:
+    ./isaaclab.sh -p scene_generation_isaaclab/sysid_isaaclab.py --robot franka --dataset droid --num_envs 43 --step_max 25
+    
+    # For Bridge dataset with WidowX:
+    ./isaaclab.sh -p scene_generation_isaaclab/sysid_isaaclab.py --robot widowx --dataset bridge --num_envs 20 --step_max 25
 """
 
 from __future__ import annotations
@@ -25,11 +29,15 @@ import imageio
 from isaaclab.app import AppLauncher
 
 # Add argument parser
-parser = argparse.ArgumentParser(description="System ID with simulated annealing on DROID trajectories")
+parser = argparse.ArgumentParser(description="System ID with simulated annealing on robot trajectories")
+parser.add_argument("--robot", type=str, default="franka", choices=["franka", "widowx"],
+                    help="Robot to use: 'franka' or 'widowx'")
+parser.add_argument("--dataset", type=str, default="droid", choices=["droid", "bridge"],
+                    help="Dataset to use: 'droid' or 'bridge'")
 parser.add_argument("--num_envs", type=int, default=2, help="Number of parallel environments")
-parser.add_argument("--step_max", type=int, default=1000, help="Number of simulated annealing steps")
-parser.add_argument("--data_dir", type=str, default="/data/user_data/yjangir/yash/IsaacLab-Cluster/scene_generation_isaaclab/data/droid_numpy/",
-                    help="Path to DROID dataset")
+parser.add_argument("--step_max", type=int, default=3, help="Number of simulated annealing steps")
+parser.add_argument("--data_dir", type=str, default=None,
+                    help="Path to dataset (auto-detected based on --dataset if not provided)")
 parser.add_argument("--output_dir", type=str, default="./results_isaaclab",
                     help="Directory to save results")
 
@@ -37,12 +45,19 @@ parser.add_argument("--output_dir", type=str, default="./results_isaaclab",
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
+# Set default data_dir based on dataset if not provided
+if args_cli.data_dir is None:
+    if args_cli.dataset == "droid":
+        args_cli.data_dir = "/data/user_data/yjangir/yash/IsaacLab-Cluster/scene_generation_isaaclab/data/droid_numpy/"
+    elif args_cli.dataset == "bridge":
+        args_cli.data_dir = "/data/group_data/katefgroup/datasets/yjangir/bridge/raw/rss"
+
 # Launch Isaac Sim
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-from simulator_isaaclab import SimulatorIsaacLab
-from utilities.data_loader import load_droid_numpy_extracted_droid
+from simulator_isaaclab import SimulatorIsaacLab, ROBOT_PARAMS
+from utilities.data_loader import load_droid_numpy_extracted_droid, load_bridge_dataset
 from utilities.visualizer import spawn_trajectory_markers_usd_tcp, spawn_trajectory_markers_usd_cartesian
 from utilities.rotations import eulertotquat, quattoeuler
 from isaaclab.managers import SceneEntityCfg
@@ -53,29 +68,40 @@ from isaaclab.utils.math import subtract_frame_transforms
 class SysIDIsaacLab:
     """
     System identification class using Isaac Lab for parallel trajectory tracking.
+    Supports both Franka Panda (DROID) and WidowX (Bridge) robots/datasets.
     """
     
     def __init__(
         self,
         robot_name: str = "franka",
+        dataset_type: str = "droid",
         n_envs: int = 43,
         show_viewer: bool = False,
-        droid_dir: str = "./data/droid_numpy",
+        data_dir: str = "./data/droid_numpy",
         device: str = "cuda:0",
     ):
         """
         Initialize the system identification environment.
         
         Args:
-            robot_name: Name of the robot
+            robot_name: Name of the robot ('franka' or 'widowx')
+            dataset_type: Dataset type ('droid' or 'bridge')
             n_envs: Number of parallel environments
             show_viewer: Whether to show viewer
-            droid_dir: Path to DROID dataset
+            data_dir: Path to dataset
             device: Compute device
         """
+        self.robot_name = robot_name
+        self.dataset_type = dataset_type
         self.n_envs = n_envs
         self.show_viewer = show_viewer
         self.device = device
+
+        # Get robot parameters
+        self.robot_params = ROBOT_PARAMS[robot_name]
+        self.n_arm_joints = self.robot_params["n_arm_joints"]
+        self.n_total_joints = self.robot_params["n_total_joints"]
+        self.default_gripper_pos = self.robot_params["default_gripper_pos"]
 
         # Create Isaac Lab simulator
         self.sim = SimulatorIsaacLab(
@@ -86,15 +112,23 @@ class SysIDIsaacLab:
             dt=0.01,
         )
         
-        self.robot = self.sim.robot
-        self.ee_link_name = "panda_hand"
+        self.ee_link_name = self.robot_params["ee_link_name"]
         self.sim.start_sim()
+        self.robot = self.sim.robot
 
-        # Load trajectories
-        self.trajectories = load_droid_numpy_extracted_droid(droid_dir)
+        # Load trajectories based on dataset type
+        if dataset_type == "droid":
+            self.trajectories = load_droid_numpy_extracted_droid(data_dir)
+        elif dataset_type == "bridge":
+            self.trajectories = load_bridge_dataset(data_dir, max_trajectories=None)
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}. Use 'droid' or 'bridge'")
+        
         trajectory = self.trajectories[0]
         self.cartesian_position = trajectory["cartesian_position"]  # (T,6)
-        # print(f"[INFO] Trajectory has {len(self.cartesian_position)} steps") 
+        print(f"[INFO] Loaded {len(self.trajectories)} trajectories from {dataset_type} dataset")
+        print(f"[INFO] First trajectory has {len(self.cartesian_position)} steps")
+        
         # Track valid environments (some may have IK failures)
         self.valid_mask = np.ones(self.n_envs, dtype=bool)
         
@@ -105,6 +139,14 @@ class SysIDIsaacLab:
         arr = np.asarray(arr, dtype=np.float64)
         arr[~self.valid_mask] = np.nan
         return arr
+
+    def _get_env_origins(self):
+        """Return env origins with shape (n_envs, 3). Expands if scene returns (1, 3)."""
+        eo = self.sim.scene.env_origins  # (B, 3) or (1, 3)
+        if eo.shape[0] != self.n_envs:
+            # Broadcast single origin to all envs (e.g. scene gave (1, 3))
+            eo = eo.expand(self.n_envs, -1).clone()
+        return eo
 
     # ------------------------------------------------------------------ #
     #  Environment Operations                                            #
@@ -164,7 +206,6 @@ class SysIDIsaacLab:
 
         pos_init, quat_init = [], []
         
-        # print(f"[INFO] Traj batch: {traj_batch}")
         for env_i in range(self.n_envs):
             data = traj_batch[env_i]
             p = data["cartesian_position"][0][:3]
@@ -172,35 +213,35 @@ class SysIDIsaacLab:
             quat = eulertotquat(euler)
             pos_init.append(p)
             quat_init.append(quat)
+            
         # Compute IK for initial poses
-        # Change dimensions of pos_init and quat_init to (n_envs, 3) and (n_envs, 4)
         pos_init = np.asarray(pos_init, dtype=np.float32).reshape(-1, 3)
         quat_init = np.asarray(quat_init, dtype=np.float32).reshape(-1, 4)
 
         pos_w = torch.tensor(pos_init, device=self.device, dtype=torch.float32)
         quat_w = torch.tensor(quat_init, device=self.device, dtype=torch.float32)
 
-        # 1) if traj is env-local, add env origins
-        pos_w = pos_w + self.sim.scene.env_origins  # (B,3)
+        # 1) if traj is env-local, add env origins (ensure shape n_envs x 3)
+        env_origins = self._get_env_origins()
+        pos_w = pos_w + env_origins  # (B,3)
 
-        # 2) convert world target -> base target
-        # print Traget ee pose 
-        root_pose_w = self.sim.robot.data.root_pose_w  # (B,7)
+        # 2) convert world target -> base target (use env_origins for position so all envs get correct offset)
+        root_quat_w = self.sim.robot.data.root_pose_w[:, 3:7]
         pos_b, quat_b = subtract_frame_transforms(
-            root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+            env_origins, root_quat_w,
             pos_w, quat_w
         )
 
         # 3) IK in base frame
         q_ik = self.sim.inverse_kinematics_batched(pos_b, quat_b)
         
-        # Build full joint position tensor (arm + gripper)
-        q_full = torch.zeros((self.n_envs, 9), device=self.device)
-        q_full[:, :7] = q_ik
-        q_full[:, 7:] = 0.04  # Default gripper position
+        # Build full joint position tensor (arm + gripper) - robot-specific
+        q_full = torch.zeros((self.n_envs, self.n_total_joints), device=self.device)
+        q_full[:, :self.n_arm_joints] = q_ik
+        q_full[:, self.n_arm_joints:] = self.default_gripper_pos
         q_vel = torch.zeros_like(q_full)
         env_ids = torch.arange(self.n_envs, device=self.device)
-        self.sim.robot.write_joint_state_to_sim(q_full[:, :7], q_vel[:, :7], joint_ids=self.sim.joint_ids, env_ids=env_ids)
+        self.sim.robot.write_joint_state_to_sim(q_full[:, :self.n_arm_joints], q_vel[:, :self.n_arm_joints], joint_ids=self.sim.joint_ids, env_ids=env_ids)
         self.sim.step()
         self.sim.scene.update(self.sim.dt)
 
@@ -245,14 +286,17 @@ class SysIDIsaacLab:
             pose_list.append(traj)
 
         pose_des = np.stack(pose_list, axis=0)  # (B,T,6)
-        # -------- add env origins ONLY to xyz (env-local -> world) --------
-        env_origins = self.sim.scene.env_origins.detach().cpu().numpy().astype(np.float32)  # (B,3)
-        pose_des[:, :, 0:3] += env_origins[:, None, :]  # broadcast over time
+        # -------- add env origins ONLY to xyz (env-local -> world); ensure (n_envs, 3) --------
+        env_origins_np = self._get_env_origins().detach().cpu().numpy().astype(np.float32)
+        pose_des[:, :, 0:3] += env_origins_np[:, None, :]  # broadcast over time
 
         pose_des = torch.from_numpy(pose_des).to(self.device)  # (B,T,6)
+        env_origins_t = self._get_env_origins()  # (n_envs, 3) on device
 
         tot_pos = 0.0
         tot_rot = 0.0
+        # Per-env position error over time (for IK/control diagnostics)
+        pos_err_per_env = np.zeros((max_steps, self.n_envs), dtype=np.float64)
 
         if record_demo:
             frames = []
@@ -269,19 +313,23 @@ class SysIDIsaacLab:
             curr_waypoint = pose_des[:, i, :]
             ee_pos_w = curr_waypoint[:, :3]
             ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
-            root_pose_w = self.sim.robot.data.root_pose_w
+            # Use env_origins for world->base so each env gets correct offset (fixes single-WidowX bug)
+            root_quat_w = self.sim.robot.data.root_pose_w[:, 3:7]
             ee_pos_b, ee_quat_b = subtract_frame_transforms(
-                root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-                ee_pos_w,   ee_quat_w
+                env_origins_t, root_quat_w,
+                ee_pos_w, ee_quat_w
             )
             q_des = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
-            q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
-            q_des_full[:, :7] = q_des
-            q_des_full[:, 7:] = 0.04
+            if q_des is None:
+                # IK failed for this step; keep previous target or skip
+                q_des = self.sim.get_qpos()[:, self.sim.joint_ids]
+            q_des_full = torch.zeros((self.n_envs, self.n_total_joints), device=self.device)
+            q_des_full[:, :self.n_arm_joints] = q_des
+            q_des_full[:, self.n_arm_joints:] = self.default_gripper_pos
             # run subloop
             for _ in range(step_per_wp):
                 # use position control
-                self.sim.robot.set_joint_position_target(q_des_full[:, :7], joint_ids=self.sim.joint_ids)
+                self.sim.robot.set_joint_position_target(q_des_full[:, :self.n_arm_joints], joint_ids=self.sim.joint_ids)
                 self.sim.step(render=record_demo)
                 self.sim.scene.update(self.sim.dt)
 
@@ -296,10 +344,20 @@ class SysIDIsaacLab:
 
             curr_waypoint_np = curr_waypoint.cpu().numpy()
             pos_err = np.linalg.norm(ee_p - curr_waypoint_np[:, :3], axis=1)
+            pos_err_per_env[i, :] = pos_err
             des_q = eulertotquat(curr_waypoint_np[:, 3:6])
             rot_err = np.array([self.quat_angle_error(ee_q[j], des_q[j]) for j in range(self.n_envs)])
             tot_pos += pos_err.mean()
             tot_rot += rot_err.mean()
+
+        # Per-env mean position error (helps see if IK or control is bad for specific envs)
+        mean_pos_err_per_env = pos_err_per_env.mean(axis=0)
+        bad = mean_pos_err_per_env > 0.02
+        if bad.any():
+            print(f"[INFO] Per-env mean position error (m): {mean_pos_err_per_env.round(4).tolist()}")
+            print(f"[WARNING] High tracking error (envs {np.where(bad)[0].tolist()}) - check IK solution or PD gains")
+        else:
+            print(f"[INFO] Per-env mean position error (m): {mean_pos_err_per_env.round(4).tolist()}")
 
         if record_demo:
             writer.close()
@@ -335,16 +393,16 @@ class SysIDIsaacLab:
         Returns:
             Tuple of (best_kp, best_kd) arrays
         """
-        full_dof = 9  # 7 arm + 2 gripper
-        opt_dof = 7   # Only optimize arm joints
+        # Robot-specific parameters
+        opt_dof = self.n_arm_joints  # Only optimize arm joints
 
-        # Initial PD values for arm
-        kp_cur = np.array([800, 800, 600, 600, 300, 300, 300], dtype=int)
-        kd_cur = np.array([80, 80, 60, 60, 30, 30, 30], dtype=int)
+        # Initial PD values from robot params
+        kp_cur = np.array(self.robot_params["kp_init"], dtype=int)
+        kd_cur = np.array(self.robot_params["kd_init"], dtype=int)
 
         # Fixed values for gripper
-        kp_fixed = np.array([100, 100])
-        kd_fixed = np.array([10, 10])
+        kp_fixed = np.array(self.robot_params["kp_gripper"])
+        kd_fixed = np.array(self.robot_params["kd_gripper"])
 
         # Range for random perturbation
         kp_rng, kd_rng = (200, 1000), (50, 200)
@@ -414,7 +472,7 @@ class SysIDIsaacLab:
                     print(f"[INFO] Current error: {comb_e:.4f}, Best error: {best_err:.4f}")
                     print(f"[INFO] Evaluating and plotting")
 
-                    self.evaluate_and_plot(best_kp, best_kd, step_per_wp=3, out_dir="./results_isaaclab", run_id=t)
+                    self.evaluate_and_plot(best_kp, best_kd, step_per_wp=5, out_dir="./results_isaaclab", run_id=t)
                     print(f"[INFO] Step {t} of {step_max} - Current error: {comb_e:.4f}, Best error: {best_err:.4f}")
 
         print(f"\n[RESULT] Best combined error = {best_err:.4f}")
@@ -432,7 +490,7 @@ class SysIDIsaacLab:
         self,
         kp: np.ndarray,
         kd: np.ndarray,
-        step_per_wp: int = 3,
+        step_per_wp: int = 5,
         out_dir: str = "./results_isaaclab",
         run_id: int = 0,
     ):
@@ -454,7 +512,7 @@ class SysIDIsaacLab:
         self.sim.diff_ik_controller.reset()
         self.reset_all_envs_to_init(traj_batch)
         self.sim.diff_ik_controller.reset()
-        
+        self.sim.warmup()
         kp_t = torch.tensor(kp, device=self.device, dtype=torch.float32).unsqueeze(0)
         kd_t = torch.tensor(kd, device=self.device, dtype=torch.float32).unsqueeze(0)
         self.sim.set_pd_all(kp_t, kd_t)
@@ -471,37 +529,48 @@ class SysIDIsaacLab:
             pose_list.append(traj)
         
         pose_des = np.stack(pose_list, axis=0)  # (B,T,6)
-        # -------- add env origins ONLY to xyz (env-local -> world) --------
-        env_origins = self.sim.scene.env_origins.detach().cpu().numpy().astype(np.float32)  # (B,3)
-        pose_des[:, :, 0:3] += env_origins[:, None, :]  # broadcast over time
+        # -------- add env origins ONLY to xyz (env-local -> world); ensure (n_envs, 3) --------
+        env_origins_np = self._get_env_origins().detach().cpu().numpy().astype(np.float32)
+        pose_des[:, :, 0:3] += env_origins_np[:, None, :]  # broadcast over time
 
         pose_des = torch.from_numpy(pose_des).to(self.device)  # (B,T,6)
+        env_origins_t = self._get_env_origins()  # (n_envs, 3) on device
 
         pos_errors = []
         rot_errors = []
         ee_pos_list = []
+        pos_err_per_env = np.zeros((max_steps, self.n_envs), dtype=np.float64)
         
         gif_path = os.path.join(out_dir, f"tcp_track_scene_{run_id}.gif")
         writer = imageio.get_writer(gif_path, mode="I", fps=20)
         print(f"[INFO] Writing gif to {gif_path}")
-        
+        # draw spheres for each env (unique parent_path per env so markers don't overwrite)
+        for env_i in range(self.n_envs):
+            spawn_trajectory_markers_usd_cartesian(
+                self.sim.sim, pose_des[env_i, :, :].cpu().numpy(), radius=0.01,
+                parent_path=f"/World/Visuals/tcp_traj_env{env_i}"
+            )
+
         for i in range(max_steps):
             curr_waypoint = pose_des[:, i, :]
             ee_pos_w = curr_waypoint[:, :3]
             ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
-            root_pose_w = self.sim.robot.data.root_pose_w
+            # Use env_origins for world->base so each env gets correct offset
+            root_quat_w = self.sim.robot.data.root_pose_w[:, 3:7]
             ee_pos_b, ee_quat_b = subtract_frame_transforms(
-                root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+                env_origins_t, root_quat_w,
                 ee_pos_w, ee_quat_w
             )
             q_des = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
-            q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
-            q_des_full[:, :7] = q_des
-            q_des_full[:, 7:] = 0.04
+            if q_des is None:
+                q_des = self.sim.get_qpos()[:, self.sim.joint_ids]
+            q_des_full = torch.zeros((self.n_envs, self.n_total_joints), device=self.device)
+            q_des_full[:, :self.n_arm_joints] = q_des
+            q_des_full[:, self.n_arm_joints:] = self.default_gripper_pos
             
             # Run subloop
             for _ in range(step_per_wp):
-                self.sim.robot.set_joint_position_target(q_des_full[:, :7], joint_ids=self.sim.joint_ids)
+                self.sim.robot.set_joint_position_target(q_des_full[:, :self.n_arm_joints], joint_ids=self.sim.joint_ids)
                 self.sim.step(render=True)
                 self.sim.scene.update(self.sim.dt)
 
@@ -514,6 +583,7 @@ class SysIDIsaacLab:
             curr_waypoint_np = curr_waypoint.cpu().numpy()
 
             pos_err = np.linalg.norm(ee_p - curr_waypoint_np[:, :3], axis=1)
+            pos_err_per_env[i, :] = pos_err
             des_q = eulertotquat(curr_waypoint_np[:, 3:6])
             rot_err = np.array([self.quat_angle_error(ee_q[j], des_q[j]) for j in range(self.n_envs)])
             
@@ -526,6 +596,11 @@ class SysIDIsaacLab:
         pos_errors = np.array(pos_errors)
         rot_errors = np.array(rot_errors)
         ee_pos_list = np.array(ee_pos_list)  # (max_steps, n_envs, 3)
+        mean_pos_err_per_env = pos_err_per_env.mean(axis=0)
+        if (mean_pos_err_per_env > 0.02).any():
+            print(f"[WARNING] Per-env mean position error (m): {mean_pos_err_per_env.round(4).tolist()} - high error envs: {np.where(mean_pos_err_per_env > 0.02)[0].tolist()}")
+        else:
+            print(f"[INFO] Per-env mean position error (m): {mean_pos_err_per_env.round(4).tolist()}")
 
         # Transpose ee_pos_list to (n_envs, max_steps, 3)
         ee_pos_list = ee_pos_list.transpose(1, 0, 2)
@@ -568,7 +643,15 @@ class SysIDIsaacLab:
         # use self.cartesian_position
         # draw spheres
         frames = []
-        spawn_trajectory_markers_usd_cartesian(self.sim.sim, self.cartesian_position, radius=0.01)
+        # spawn trajectory markers for each env (world positions = local + env_origin)
+        env_origins_np = self._get_env_origins().detach().cpu().numpy()
+        for env_i in range(self.n_envs):
+            traj_world = np.asarray(self.cartesian_position, dtype=np.float64).copy()
+            traj_world[:, :3] += env_origins_np[env_i]
+            spawn_trajectory_markers_usd_cartesian(
+                self.sim.sim, traj_world, radius=0.01,
+                parent_path=f"/World/Visuals/tcp_traj_env{env_i}"
+            )
 
         self.sim.step(render=True)
         self.sim.scene.update(self.sim.dt)
@@ -595,10 +678,8 @@ class SysIDIsaacLab:
             jacobian = self.sim.robot.root_physx_view.get_jacobians()[:, self.sim.ee_jacobi_idx, :, self.sim.joint_ids]
             joint_pos = self.sim.robot.data.joint_pos[:, self.sim.joint_ids]
             des_q = self.sim.diff_ik_controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
-            vel_target = torch.zeros_like(des_q)
-            vel_target[:, 7:] = 0.04
-            # self.sim.robot.write_joint_state_to_sim(des_q[:, :7], vel_target[:, :7], joint_ids=self.sim.joint_ids)
-            self.sim.robot.set_joint_position_target(des_q[:, :7], joint_ids=self.sim.joint_ids)
+            # Use position control for arm joints
+            self.sim.robot.set_joint_position_target(des_q, joint_ids=self.sim.joint_ids)
             self.sim.scene.write_data_to_sim()
             self.sim.step(render=True)
             self.sim.scene.update(self.sim.dt)
@@ -641,32 +722,31 @@ class SysIDIsaacLab:
 
         pose_des = np.stack(pose_list, axis=0)  # (B, max_steps, 6)
 
-        env_origins = self.sim.scene.env_origins.detach().cpu().numpy()  # (B,3)
-
+        # Ensure env_origins (n_envs, 3) so each env gets its own offset
+        env_origins_np = self._get_env_origins().detach().cpu().numpy()
         env_pad = np.zeros((self.n_envs, 1, 6), dtype=pose_des.dtype)
-        env_pad[:, 0, :3] = env_origins
+        env_pad[:, 0, :3] = env_origins_np
 
         pose_des = pose_des + env_pad
-        pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32)
-
         pose_des = torch.tensor(pose_des, device=self.device, dtype=torch.float32).reshape(self.n_envs, max_steps, 6)
+        env_origins_t = self._get_env_origins()
         print("[INFO] pose_des:", pose_des.shape)
 
         for i in range(max_steps):
             curr_waypoint = pose_des[:, i, :]
             ee_pos_w = curr_waypoint[:, :3]
             ee_quat_w = torch.tensor(eulertotquat(curr_waypoint[:, 3:6].cpu().numpy()), device=self.device, dtype=torch.float32)
-            root_pose_w = self.sim.robot.data.root_pose_w
+            root_quat_w = self.sim.robot.data.root_pose_w[:, 3:7]
             ee_pos_b, ee_quat_b = subtract_frame_transforms(
-                root_pose_w[:, 0:3], root_pose_w[:, 3:7],
-                ee_pos_w,   ee_quat_w
+                env_origins_t, root_quat_w,
+                ee_pos_w, ee_quat_w
             )
             q_des = self.sim.inverse_kinematics_batched(ee_pos_b, ee_quat_b)
-            q_des_full = torch.zeros((self.n_envs, 9), device=self.device)
-            q_des_full[:, :7] = q_des
-            q_des_full[:, 7:] = 0.04
+            q_des_full = torch.zeros((self.n_envs, self.n_total_joints), device=self.device)
+            q_des_full[:, :self.n_arm_joints] = q_des
+            q_des_full[:, self.n_arm_joints:] = self.default_gripper_pos
             # use position control
-            self.sim.robot.set_joint_position_target(q_des_full[:, :7], joint_ids=self.sim.joint_ids)
+            self.sim.robot.set_joint_position_target(q_des_full[:, :self.n_arm_joints], joint_ids=self.sim.joint_ids)
             self.sim.step(render=True)
             self.sim.scene.update(self.sim.dt)
             self.sim.camera.update(self.sim.dt)
@@ -685,24 +765,19 @@ class SysIDIsaacLab:
 def main():
     """Main function."""
     print("[INFO] Starting Isaac Lab System Identification...")
+    print(f"[INFO] Robot: {args_cli.robot}")
+    print(f"[INFO] Dataset: {args_cli.dataset}")
+    print(f"[INFO] Data dir: {args_cli.data_dir}")
     
-    # Count available trajectories
-    try:
-        n_traj = len(os.listdir(args_cli.data_dir))
-        print("[INFO] data_dir:", args_cli.data_dir)
-        print("[INFO] n_traj:", n_traj//3)
-        print(f"[INFO] Found {n_traj//3} trajectories in dataset")
-    except Exception as e:
-        print(f"[WARN] Could not count trajectories: {e}")
-        n_traj = args_cli.num_envs
+    # Create output directory
+    os.makedirs(args_cli.output_dir, exist_ok=True)
     
-    # Use minimum of available trajectories and requested envs
-    n_envs = min(n_traj, args_cli.num_envs)
-    
-    # Create SysID environment
+    # Create SysID environment with specified robot and dataset
     env = SysIDIsaacLab(
-        n_envs=n_envs,
-        droid_dir=args_cli.data_dir,
+        robot_name=args_cli.robot,
+        dataset_type=args_cli.dataset,
+        n_envs=args_cli.num_envs,
+        data_dir=args_cli.data_dir,
         show_viewer=not args_cli.headless,
     )
 

@@ -43,19 +43,129 @@ from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG,FRANKA_PANDA_CFG
 import isaaclab_assets as isaaclab_assets
 print([x for x in dir(isaaclab_assets) if "FRANKA" in x])
 # import data loader
-from utilities.data_loader import load_droid_numpy_extracted_droid
+from utilities.data_loader import load_droid_numpy_extracted_droid, load_bridge_dataset
 from utilities.visualizer import spawn_trajectory_markers_usd_tcp, spawn_trajectory_markers_usd_cartesian
 from utilities.rotations import eulertotquat, quattoeuler
 from isaaclab.actuators import ImplicitActuator
+from typing import Optional
 
+# Get the directory of this file for asset paths
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# --------------------------------------------------------------------------- #
+#  WidowX Robot Configuration                                                  #
+# --------------------------------------------------------------------------- #
+WIDOWX_USD_PATH = os.path.join(THIS_DIR, "utilities/assets/WidowX_new/WidowX.usd")
+
+WIDOWX_CFG = ArticulationCfg(
+    prim_path="{ENV_REGEX_NS}/Robot",
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=WIDOWX_USD_PATH,
+        scale=(1.0, 1.0, 1.0),
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            fix_root_link=True,
+        ),
+        semantic_tags=[("class", "Robot")],
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        joint_pos={
+            "left_finger": 0.02,
+            "right_finger": 0.02,
+        },
+    ),
+    # Conservative initial PD gains (aligned with ROBOT_PARAMS widowx); sysid can tune up if needed
+    actuators={
+        "waist": ImplicitActuatorCfg(
+            joint_names_expr=["waist"],
+            stiffness=400,
+            damping=40,
+        ),
+        "shoulder": ImplicitActuatorCfg(
+            joint_names_expr=["shoulder"],
+            stiffness=400,
+            damping=40,
+        ),
+        "elbow": ImplicitActuatorCfg(
+            joint_names_expr=["elbow"],
+            stiffness=300,
+            damping=30,
+        ),
+        "forearm_roll": ImplicitActuatorCfg(
+            joint_names_expr=["forearm_roll"],
+            stiffness=300,
+            damping=30,
+        ),
+        "wrist_angle": ImplicitActuatorCfg(
+            joint_names_expr=["wrist_angle"],
+            stiffness=200,
+            damping=20,
+        ),
+        "wrist_rotate": ImplicitActuatorCfg(
+            joint_names_expr=["wrist_rotate"],
+            stiffness=200,
+            damping=20,
+        ),
+        "left_finger": ImplicitActuatorCfg(
+            joint_names_expr=["left_finger"],
+            stiffness=100,
+            damping=10,
+        ),
+        "right_finger": ImplicitActuatorCfg(
+            joint_names_expr=["right_finger"],
+            stiffness=100,
+            damping=10,
+        ),
+    },
+)
+
+# --------------------------------------------------------------------------- #
+#  Robot Parameters Dictionary                                                 #
+# --------------------------------------------------------------------------- #
+ROBOT_PARAMS = {
+    "franka": {
+        "ee_link_name": "panda_hand",
+        "arm_joint_names": ["panda_joint.*"],
+        "arm_joint_list": [
+            "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
+            "panda_joint5", "panda_joint6", "panda_joint7"
+        ],
+        "n_arm_joints": 7,
+        "n_finger_joints": 2,
+        "n_total_joints": 9,
+        "default_gripper_pos": 0.04,
+        # Initial PD gains for SysID
+        "kp_init": [800, 800, 600, 600, 300, 300, 300],
+        "kd_init": [80, 80, 60, 60, 30, 30, 30],
+        "kp_gripper": [100, 100],
+        "kd_gripper": [10, 10],
+    },
+    "widowx": {
+        "ee_link_name": "ee_gripper_link",
+        "arm_joint_names": ["waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"],
+        "arm_joint_list": ["waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"],
+        "n_arm_joints": 6,
+        "n_finger_joints": 2,
+        "n_total_joints": 8,
+        "default_gripper_pos": 0.02,
+        # Initial PD gains for SysID (conservative starting values)
+        "kp_init": [400, 400, 300, 300, 200, 200],
+        "kd_init": [40, 40, 30, 30, 20, 20],
+        "kp_gripper": [100, 100],
+        "kd_gripper": [10, 10],
+    },
+}
+
+# --------------------------------------------------------------------------- #
+#  Scene Configurations                                                        #
+# --------------------------------------------------------------------------- #
 @configclass
-class ReplaySceneCfg(InteractiveSceneCfg):
-    """Scene configuration for trajectory replay."""
-
+class FrankaSceneCfg(InteractiveSceneCfg):
+    """Scene configuration for Franka Panda robot."""
     robot = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    # Camera for rendering
-
     camera = CameraCfg(
         prim_path="/World/CameraSensor",
         update_period=0,
@@ -71,65 +181,28 @@ class ReplaySceneCfg(InteractiveSceneCfg):
         )
     )
 
-# @configclass
-# class PandaSysIDSceneCfg(InteractiveSceneCfg):
-#     """Scene configuration for Panda system identification."""
-#     robot = PandaConfig.replace(prim_path="{ENV_REGEX_NS}/Robot")
-#     # Camera for rendering
-#     camera = CameraCfg(
-#         prim_path="{ENV_REGEX_NS}/CameraSensor1",
-#         update_period=0,
-#         height=480,
-#         width=640,
-#         data_types=["rgb"],
-#         spawn=sim_utils.PinholeCameraCfg(
-#             focal_length=24.0,
-#             focus_distance=400.0,
-#             vertical_aperture=20.955,
-#             horizontal_aperture=20.955 * (640 / 480),
-#             clipping_range=(0.1, 1.0e3)
-#         )
-#     )
+@configclass
+class WidowXSceneCfg(InteractiveSceneCfg):
+    """Scene configuration for WidowX robot."""
+    robot = WIDOWX_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    camera = CameraCfg(
+        prim_path="/World/CameraSensor",
+        update_period=0,
+        height=480,
+        width=640,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            vertical_aperture=20.955,
+            horizontal_aperture=20.955 * (640 / 480),
+            clipping_range=(0.1, 1.0e3)
+        )
+    )
 
-# @configclass
-# class UR5SysIDSceneCfg(InteractiveSceneCfg):
-#     """Scene configuration for UR5 system identification."""
-#     robot = UR5Config.replace(prim_path="{ENV_REGEX_NS}/Robot")
-#     # Camera for rendering
-#     camera = CameraCfg(
-#         prim_path="{ENV_REGEX_NS}/CameraSensor1",
-#         update_period=0,
-#         height=480,
-#         width=640,
-#         data_types=["rgb"],
-#         spawn=sim_utils.PinholeCameraCfg(
-#             focal_length=24.0,
-#             focus_distance=400.0,
-#             vertical_aperture=20.955,
-#             horizontal_aperture=20.955 * (640 / 480),
-#             clipping_range=(0.1, 1.0e3)
-#         )
-#     )
+# Alias for backward compatibility
+ReplaySceneCfg = FrankaSceneCfg
 
-# @configclass
-# class WidowXSysIDSceneCfg(InteractiveSceneCfg):
-#     """Scene configuration for WidowX system identification."""
-#     robot = WidowXConfig.replace(prim_path="{ENV_REGEX_NS}/Robot")
-#     # Camera for rendering
-#     camera = CameraCfg(
-#         prim_path="{ENV_REGEX_NS}/CameraSensor1",
-#         update_period=0,
-#         height=480,
-#         width=640,
-#         data_types=["rgb"],
-#         spawn=sim_utils.PinholeCameraCfg(
-#             focal_length=24.0,
-#             focus_distance=400.0,
-#             vertical_aperture=20.955,   
-#             horizontal_aperture=20.955 * (640 / 480),
-#             clipping_range=(0.1, 1.0e3)
-#         )
-#     )
 
 class SimulatorIsaacLab:
     """
@@ -156,15 +229,19 @@ class SimulatorIsaacLab:
         Initialize the Isaac Lab simulator wrapper.
         
         Args:
-            robot_name: Name of the robot (currently only 'franka' supported)
+            robot_name: Name of the robot ('franka' or 'widowx')
             n_envs: Number of parallel environments
             device: Device to run simulation on ('cuda:0', 'cpu', etc.)
             show_viewer: Whether to show the GUI viewer
             dt: Simulation timestep
             env_spacing: Spacing between environments in the grid
+            record: Whether to record video
         """
         global record_demo 
         self.record_demo = record
+
+        if robot_name not in ROBOT_PARAMS:
+            raise ValueError(f"Unknown robot: {robot_name}. Available: {list(ROBOT_PARAMS.keys())}")
 
         self.robot_name = robot_name
         self.n_envs = n_envs
@@ -177,12 +254,15 @@ class SimulatorIsaacLab:
         self.robot = None
         self.diff_ik_controller = None
         
-        # Robot-specific parameters
-        self.ee_link_name = "panda_hand"
-        self.arm_joint_names = ["panda_joint.*"]
-        self.n_arm_joints = 7
-        self.n_finger_joints = 2
-        self.n_total_joints = 9
+        # Robot-specific parameters from ROBOT_PARAMS
+        params = ROBOT_PARAMS[robot_name]
+        self.ee_link_name = params["ee_link_name"]
+        self.arm_joint_names = params["arm_joint_names"]
+        self.arm_joint_list = params["arm_joint_list"]
+        self.n_arm_joints = params["n_arm_joints"]
+        self.n_finger_joints = params["n_finger_joints"]
+        self.n_total_joints = params["n_total_joints"]
+        self.default_gripper_pos = params["default_gripper_pos"]
 
 
     def start_sim(self, args_cli=None):
@@ -200,7 +280,11 @@ class SimulatorIsaacLab:
             )
 
         self.sim = sim_utils.SimulationContext(sim_cfg)
-        sim_utils.spawn_ground_plane("/World/defaultGroundPlane", cfg=sim_utils.GroundPlaneCfg())
+        
+        # Only spawn ground plane for Franka/DROID (not for WidowX/Bridge)
+        if self.robot_name != "widowx":
+            sim_utils.spawn_ground_plane("/World/defaultGroundPlane", cfg=sim_utils.GroundPlaneCfg())
+        
         sim_utils.spawn_light(
             "/World/Light",
             cfg=sim_utils.DomeLightCfg(intensity=300.0, color=(0.75, 0.75, 0.75)),
@@ -225,13 +309,18 @@ class SimulatorIsaacLab:
         self.sim.reset()
         self.scene.reset()
 
-        # Setup robot entity configuration for IK
+        # Setup robot entity configuration for IK (use robot-specific joint names)
         self.robot_entity_cfg = SceneEntityCfg(
             "robot",
-            joint_names=["panda_joint.*"],
+            joint_names=self.arm_joint_list,
             body_names=[self.ee_link_name],
         )
         self.robot_entity_cfg.resolve(self.scene)
+        
+        print(f"[INFO] Robot: {self.robot_name}")
+        print(f"[INFO] Joint names: {self.robot.joint_names}")
+        print(f"[INFO] Body names: {self.robot.body_names}")
+        print(f"[INFO] EE link: {self.ee_link_name}")
 
         # Get end-effector Jacobian index
         if self.robot.is_fixed_base:
@@ -271,9 +360,9 @@ class SimulatorIsaacLab:
         # Without this, the implicit actuators have no target and the arm falls under gravity
         self.robot.set_joint_position_target(self.robot.data.joint_pos.clone())
         
-        #  Use default joint positions for warmup
-        default_joint_pos = self.robot.data.default_joint_pos.clone()[:,:self.ee_jacobi_idx]
-        default_joint_vel = self.robot.data.default_joint_vel.clone()[:,:self.ee_jacobi_idx]
+        # Use default joint positions for warmup (only for arm joints)
+        default_joint_pos = self.robot.data.default_joint_pos[:, self.joint_ids].clone()
+        default_joint_vel = self.robot.data.default_joint_vel[:, self.joint_ids].clone()
         self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, joint_ids=self.joint_ids)
 
         #  Reset the robot
@@ -354,12 +443,20 @@ class SimulatorIsaacLab:
 
     def setup_robot_config(self, robot_name: str):
         """
-        Setup the robot configuration.
+        Setup the robot configuration based on robot name.
+        
+        Args:
+            robot_name: 'franka' or 'widowx'
+            
+        Returns:
+            Scene configuration for the specified robot
         """
         if robot_name == "franka":
-            return ReplaySceneCfg(num_envs=self.n_envs, env_spacing=2.0, replicate_physics=True)
+            return FrankaSceneCfg(num_envs=self.n_envs, env_spacing=2.0, replicate_physics=True)
+        elif robot_name == "widowx":
+            return WidowXSceneCfg(num_envs=self.n_envs, env_spacing=2.0, replicate_physics=True)
         else:
-            raise ValueError(f"Invalid robot name: {robot_name}")
+            raise ValueError(f"Invalid robot name: {robot_name}. Available: franka, widowx")
 
     def warmup(self):
         """
@@ -564,14 +661,14 @@ class SimulatorIsaacLab:
         joint_ids = self.robot_entity_cfg.joint_ids
         joint_pos = self.get_qpos()[:, joint_ids]                  # (n_envs, n_joints)
 
-        # print(f"ee_pos_w: {ee_pos_w.shape}, ee_quat_w: {ee_quat_w.shape}")
-        # print(f"jacobian: {jacobian.shape}, joint_pos: {joint_pos.shape}")
-        # # EE pose in ROOT frame
-        root_pose_w = self.robot.data.root_state_w[:, 0:7]         # (n_envs, 7)
-        # print(f"root_pose_w: {root_pose_w.shape}")
-        # print(f"root_pose_w: {self.robot.data.root_state_w}")
+        # EE pose in base frame: use env_origins for position so frame matches sysid (target in base)
+        # Using root_pose_w position can be wrong for some envs; env_origins is the true per-env base position.
+        env_origins = self.scene.env_origins
+        if env_origins.shape[0] != n:
+            env_origins = env_origins.expand(n, -1).clone()
+        root_quat_w = self.robot.data.root_state_w[:, 3:7]         # (n_envs, 4)
         ee_pos_b, ee_quat_b = subtract_frame_transforms(
-            root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+            env_origins, root_quat_w,
             ee_pos_w, ee_quat_w
         )
 
